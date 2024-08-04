@@ -26,14 +26,14 @@ class QuestCache:
         self,
         block_size,
         skip_layers,
-        ratio,
+        budget_size,
         model,
         k_seq_dim=2,
         v_seq_dim=2,
     ):
         self.block_size = block_size
         self.skip_layers = skip_layers
-        self.ratio = ratio
+        self.budget_size = budget_size
         self.model = model
 
         self.k_seq_dim = k_seq_dim
@@ -42,7 +42,7 @@ class QuestCache:
         self.v_slice = DIM_TO_SLICE[v_seq_dim]
         self.past_key_values = []
 
-    def __call__(self, past_key_values, num_of_token=None, attentions=None, query=None, new_cache_len=1):
+    def update(self, past_key_values, new_cache_len):
         # update local kv cache
         if len(self.past_key_values) == 0:
             # TODO: slow update
@@ -50,9 +50,12 @@ class QuestCache:
                 self.past_key_values.append([k, v])
         else:
             for layer_idx, (k, v) in enumerate(past_key_values):
-                self.past_key_values[layer_idx][0] = torch.cat([self.past_key_values[layer_idx][0], k[:,:,-new_cache_len:,:]], dim=self.k_seq_dim)
-                self.past_key_values[layer_idx][1] = torch.cat([self.past_key_values[layer_idx][1], v[:,:,-new_cache_len:,:]], dim=self.v_seq_dim)
+                self.past_key_values[layer_idx] = [
+                    torch.cat([self.past_key_values[layer_idx][0], k[:,:,-new_cache_len:,:]], dim=self.k_seq_dim),
+                    torch.cat([self.past_key_values[layer_idx][1], v[:,:,-new_cache_len:,:]], dim=self.v_seq_dim)
+                ]
 
+    def __call__(self, past_key_values, query=None):
         past_key_values = self.past_key_values
 
         # NOTE: profiling with block max/min
@@ -105,8 +108,7 @@ class QuestCache:
         qlen = query.size(-2)
         max_block_num = max_attentions[0].size(-1) - qlen
         # TODO: upround to void 0
-        topk = int((seq_len * self.ratio + self.block_size - 1) / self.block_size)
-        topk = min(topk, max_block_num)
+        topk = int(self.budget_size / self.block_size)
 
         for layer_idx in range(len(max_attentions)):
             if layer_idx < self.skip_layers:
