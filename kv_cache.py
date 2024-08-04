@@ -57,8 +57,7 @@ class QuestCache:
 
         # NOTE: profiling with block max/min
         bs, head_num, seq_len, head_dim = past_key_values[0][0].shape
-        max_block_num = (seq_len + self.block_size - 1) // self.block_size
-        device=past_key_values[0][0].device
+        device=past_key_values[1][0].device
 
         # estimated_block
         block_max = []
@@ -101,15 +100,24 @@ class QuestCache:
         replace_flash_attention(self.model)
 
         selected_cache = []
-        topk = int((num_of_token * self.ratio) / self.block_size)
+
+        # TODO: remove new query cache
+        qlen = query.size(-2)
+        max_block_num = max_attentions[0].size(-1) - qlen
+        # TODO: upround to void 0
+        topk = int((seq_len * self.ratio + self.block_size - 1) / self.block_size)
+        topk = min(topk, max_block_num)
+
         for layer_idx in range(len(max_attentions)):
+            if layer_idx < self.skip_layers:
+                selected_cache.append(past_key_values[layer_idx])
+                continue
+
             # remove last token (a snap query)
-            max_attention = max_attentions[layer_idx].mean(dim=-2)[:,:,:-2]
-            min_attention = min_attentions[layer_idx].mean(dim=-2)[:,:,:-2]
+            max_attention = max_attentions[layer_idx].mean(dim=-2)[..., :-qlen]
+            min_attention = min_attentions[layer_idx].mean(dim=-2)[..., :-qlen]
 
             channel_max = torch.max(max_attention, min_attention)
-            # TODO: hard code for now
-            # block index
             # TODO: sort? keep pos
             index = torch.topk(channel_max, topk, dim=-1).indices.sort(dim=-1).values
 
@@ -121,6 +129,7 @@ class QuestCache:
 
             # TODO: batch select
 
+            # TODO: review
             # algo 1
             # padding
             # reshape (bs, num_heads, qlen // block_size, block_size, dim)
