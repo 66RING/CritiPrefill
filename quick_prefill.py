@@ -2,14 +2,14 @@ import torch
 
 from kv_cache import QuestCache
 
-BLOCK_SIZE = 4
+BLOCK_SIZE = 128
 RATIO = 0.5
 
 @torch.no_grad()
-def generate(input_ids, model, tokenizer, max_generation=50):
+def generate(input_ids, model, max_new_tokens=50, eos_token_id=[]):
     next_input = input_ids
     generated_ids = input_ids
-    max_length = input_ids.size(-1) + max_generation
+    max_length = input_ids.size(-1) + max_new_tokens
 
     past_key_values = None
     # TODO: remove
@@ -25,6 +25,9 @@ def generate(input_ids, model, tokenizer, max_generation=50):
         if is_prefill:
             print("naive prefill cache.shape", past_key_values[0][0].shape)
         is_prefill = False
+
+        if next_input[0] in eos_token_id:
+            break
 
     print("naive", past_key_values[0][0].shape)
     return generated_ids
@@ -58,10 +61,11 @@ def segment_prefill(input_ids, model, block_size):
     return next_token_id, past_key_values
 
 @torch.no_grad()
-def quick_generate(input_ids, model, tokenizer, max_generation=50):
+def quick_generate(input_ids, model, max_new_tokens=50, eos_token_id=[]):
+    assert input_ids.size(0) == 1
     next_input = input_ids
     generated_ids = input_ids
-    max_length = input_ids.size(-1) + max_generation
+    max_length = input_ids.size(-1) + max_new_tokens
 
     past_key_values = None
     while generated_ids.size(-1) < max_length:
@@ -75,7 +79,8 @@ def quick_generate(input_ids, model, tokenizer, max_generation=50):
             past_key_values = outputs.past_key_values
         generated_ids = torch.cat([generated_ids, next_input], dim=-1)
 
-        if tokenizer.eos_token_id in next_input:
+        # TODO: single batch for now
+        if next_input[0] in eos_token_id:
             break
     print("quick", past_key_values[0][0].shape)
 

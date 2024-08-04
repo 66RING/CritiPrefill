@@ -27,7 +27,7 @@ def main(args):
 
     t = time.time()
     torch.cuda.synchronize()
-    generated_ids = generate(input_ids, model, tokenizer)
+    generated_ids = generate(input_ids, model)
     torch.cuda.synchronize()
     t = time.time() - t
     print("naive time:", t)
@@ -38,7 +38,7 @@ def main(args):
 
     t = time.time()
     torch.cuda.synchronize()
-    generated_ids = quick_generate(input_ids, model, tokenizer)
+    generated_ids = quick_generate(input_ids, model)
     torch.cuda.synchronize()
     t = time.time() - t
     print("quick time:", t)
