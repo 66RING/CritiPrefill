@@ -1,5 +1,5 @@
 import transformers
-from hijack_llama import llama_attn_forward
+from hijack_llama import llama_attn_forward, llama_eattention_forward
 
 def replace_llama():
     transformers.models.llama.modeling_llama.LlamaFlashAttention2.forward = llama_attn_forward
@@ -11,3 +11,7 @@ def replace_naive_attention(model):
 def replace_flash_attention(model):
     for layer in model.model.layers:
         layer.self_attn.naive = False
+
+def replace_llama_eattention():
+    transformers.models.llama.modeling_llama.LlamaFlashAttention2.forward = llama_eattention_forward
+

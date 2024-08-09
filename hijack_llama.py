@@ -169,4 +169,223 @@ def llama_attn_forward(
 
         return attn_output, attn_weights, past_key_value
 
+def llama_eattention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.LongTensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Cache] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
+    import nvtx
+    def cache_compress(future_query_states, key_states, value_states, cache_len, block_size, budget_size, stay_size):
+        # copy_old_rng = nvtx.start_range("copy old")
+        # nvtx.end_range(copy_old_rng)
+
+
+        # return key_states[:, :budget_size], value_states[:, :budget_size]
+        # q,k,v shape = (bsz, len, num_heads, head_dim)
+        assert block_size <= stay_size
+
+        bsz, future_q_len, head_num, head_dim = future_query_states.shape
+        device = future_query_states.device
+        layer_block_max_k = []
+        layer_block_min_k = []
+        left_over = 0
+        
+        # # TODO: algo 1
+        # # TODO: algo2: pooling and then sampling
+        # # NOTE: always keep last segment to compute new cache
+        # cnt = 0
+        # for i in range(0, cache_len - stay_size, block_size):
+        #     print(i)
+        #     cnt += 1
+        #     start_index = i
+        #     end_index = start_index + block_size
+        #     left_over = cache_len - end_index
+
+        #     layer_block_max_k.append(key_states[:, start_index:end_index].max(dim=1, keepdim=True).values)
+        #     layer_block_min_k.append(key_states[:, start_index:end_index].min(dim=1, keepdim=True).values)
+
+
+        # # algo 2
+        # layer_block_max_k = key_states[:,:(cache_len - stay_size)//block_size]
+        # layer_block_min_k = key_states[:,:(cache_len - stay_size)//block_size]
+        # left_over = cache_len - (cache_len - stay_size)//block_size * block_size
+
+        # future_query_states = future_query_states.transpose(1, 2)
+        # layer_block_max_k = layer_block_max_k.transpose(1, 2)
+        # layer_block_min_k = layer_block_min_k.transpose(1, 2)
+        # # NOTE: here q,k,v shape = (bsz, num_heads, len, head_dim)
+
+
+        # algo 3 pooling
+        future_query_states = future_query_states.transpose(1, 2)
+        layer_block_max_k = key_states.transpose(1, 2)
+        layer_block_min_k = layer_block_max_k
+        import torch.nn
+        pool_len = (cache_len - stay_size)//block_size * block_size
+        pooling = nn.MaxPool1d(block_size, stride=block_size)
+        layer_block_max_k = pooling(layer_block_max_k[:,:,:pool_len].view(bsz * head_num, -1, head_dim).transpose(-1, -2))
+        layer_block_min_k = pooling(layer_block_min_k[:,:,:pool_len].view(bsz * head_num, -1, head_dim).transpose(-1, -2) * -1) * -1
+        left_over = cache_len - pool_len
+        layer_block_max_k = layer_block_max_k.transpose(-1, -2).view(bsz, head_num, -1, head_dim)
+        layer_block_min_k = layer_block_min_k.transpose(-1, -2).view(bsz, head_num, -1, head_dim)
+
+
+        # shape = (bsz, num_heads, future_q_len, block_nums)
+        attn_weights_max = torch.matmul(future_query_states, layer_block_max_k.transpose(2, 3))
+        attn_weights_min = torch.matmul(future_query_states, layer_block_min_k.transpose(2, 3))
+
+        # shape = (bsz, num_heads, block_nums)
+        # NOTE: max pooling along the future_q_len
+        attn_weights_max = attn_weights_max.max(dim=2).values
+        attn_weights_min = attn_weights_min.min(dim=2).values
+        channel_max = torch.max(attn_weights_min, attn_weights_max)
+
+        # TODO: -1
+        topk = budget_size // block_size - 1
+        index = torch.topk(channel_max, topk, dim=-1).indices
+
+        max_block_num = channel_max.size(-1)
+        r = torch.arange(0, max_block_num * block_size, device=device)[None, None, :]
+        r = r.expand(bsz, head_num, max_block_num * block_size).view(bsz, head_num, max_block_num, block_size)
+
+        index = torch.gather(r, 2, index.unsqueeze(-1).expand(-1, -1, -1, block_size))
+        index = index.view(bsz, head_num, -1).transpose(1, 2)
+
+        # TODO: always keep last segment?? and sink token?
+
+        layer_selected_k = torch.gather(key_states, dim=1, index=index.unsqueeze(-1).expand(-1, -1, -1, head_dim))
+        layer_selected_v = torch.gather(value_states, dim=1, index=index.unsqueeze(-1).expand(-1, -1, -1, head_dim))
+        layer_selected_k = torch.cat([layer_selected_k, key_states[:, -left_over:]], dim=1)
+        layer_selected_v = torch.cat([layer_selected_v, value_states[:, -left_over:]], dim=1)
+        return layer_selected_k, layer_selected_v
+
+
+    def eattention(segment_size, threshold_len, budgets, block_size, query_states, key_states, value_states):
+        from flash_attn import flash_attn_func
+        # NOTE: q,k,v shape = (bsz, len, num_heads, head_dim)
+
+        input_len = query_states.size(1)
+        if input_len == 1:
+            # decoding
+            cache_len = key_states.size(1)
+            key_states, value_states = cache_compress(query_states, key_states, value_states, cache_len, block_size, budgets, block_size)
+            attn_output = flash_attn_func(
+                query_states, key_states, value_states, causal=True
+            )
+        else:
+            # NOTE: full cache k, v
+            attn_outputs = []
+            for i in range(0, input_len, segment_size):
+                q_segment = query_states[:, i:i+segment_size,:,:]
+                k_segment = key_states[:, :i+segment_size,:,:]
+                v_segment = value_states[:, :i+segment_size,:,:]
+                if i > threshold_len or input_len == 1:
+                    future_q = q_segment[:, 0::segment_size//10, :]
+                    cache_len = k_segment.size(1)
+                    k_segment, v_segment = cache_compress(future_q, k_segment, v_segment, cache_len, block_size, budgets, segment_size)
+
+                attn_output = flash_attn_func(
+                    q_segment, k_segment, v_segment, causal=True
+                )
+                attn_outputs.append(attn_output)
+
+            attn_output = torch.cat(attn_outputs, dim=1)
+        return attn_output
+
+
+    output_attentions = False
+
+    bsz, q_len, _ = hidden_states.size()
+    # NOTE: hard code for now
+    is_prefill = q_len != 1
+
+    query_states = self.q_proj(hidden_states)
+    key_states = self.k_proj(hidden_states)
+    value_states = self.v_proj(hidden_states)
+
+    # Flash attention requires the input to have the shape
+    # batch_size x seq_length x head_dim x hidden_dim
+    # therefore we just need to keep the original shape
+    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    past_key_value = getattr(self, "past_key_value", past_key_value)
+
+    if past_key_value is not None:
+        # sin and cos are specific to RoPE models; cache_position needed for the static cache
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+    # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
+    # to be able to avoid many of these transpose/reshape/view.
+    query_states = query_states.transpose(1, 2)
+    key_states = key_states.transpose(1, 2)
+    value_states = value_states.transpose(1, 2)
+
+    dropout_rate = self.attention_dropout if self.training else 0.0
+
+    # In PEFT, usually we cast the layer norms in float32 for training stability reasons
+    # therefore the input hidden states gets silently casted in float32. Hence, we need
+    # cast them back in the correct dtype just to be sure everything works as expected.
+    # This might slowdown training & inference so it is recommended to not cast the LayerNorms
+    # in fp32. (LlamaRMSNorm handles it correctly)
+
+    input_dtype = query_states.dtype
+    if input_dtype == torch.float32:
+        if torch.is_autocast_enabled():
+            target_dtype = torch.get_autocast_gpu_dtype()
+        # Handle the case where the model is quantized
+        elif hasattr(self.config, "_pre_quantization_dtype"):
+            target_dtype = self.config._pre_quantization_dtype
+        else:
+            target_dtype = self.q_proj.weight.dtype
+
+        logger.warning_once(
+            f"The input hidden states seems to be silently casted in float32, this might be related to"
+            f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
+            f" {target_dtype}."
+        )
+
+        query_states = query_states.to(target_dtype)
+        key_states = key_states.to(target_dtype)
+        value_states = value_states.to(target_dtype)
+
+    # if is_prefill and self.layer_idx > 0:
+    if self.layer_idx > 0:
+        # TODO: hard code for now
+        segment_size = 1024 * 2
+        threshold_len = 1024 * 4
+        block_size = 16
+        budgets = 512
+
+        # segment_size = 1024
+        # threshold_len = 1024
+        # block_size = 4
+        # budgets = 128
+        attn_output = eattention(segment_size, threshold_len, budgets, block_size, query_states, key_states, value_states)
+    else:
+        attn_output = self._flash_attention_forward(
+            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
+        )
+    assert attn_output.size(1) == q_len, f"outlen={attn_output.size(1)}, q_len={q_len}"
+
+    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+    attn_output = self.o_proj(attn_output)
+
+    if not output_attentions:
+        attn_weights = None
+
+    return attn_output, attn_weights, past_key_value
+
 
