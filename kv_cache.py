@@ -1,6 +1,7 @@
 import torch
 import random
 import numpy as np
+import torch.nn.functional as F
 from modeling_patch import replace_naive_attention, replace_flash_attention
 
 def slice2d(x, start, end):
@@ -149,3 +150,134 @@ class QuestCache:
 
         return selected_cache
 
+
+class FlashCache:
+    def __init__(
+        self,
+        block_size,
+        skip_layers,
+        budget_size,
+        model,
+        k_seq_dim=2,
+        v_seq_dim=2,
+    ):
+        self.block_size = block_size
+        self.skip_layers = skip_layers
+        self.budget_size = budget_size
+        self.model = model
+
+        self.k_seq_dim = k_seq_dim
+        self.v_seq_dim = v_seq_dim
+        self.k_slice = DIM_TO_SLICE[k_seq_dim]
+        self.v_slice = DIM_TO_SLICE[v_seq_dim]
+        self.past_key_values = []
+
+    def update(self, past_key_values, new_cache_len):
+        self.past_key_values = past_key_values
+
+    def __call__(self, past_key_values, query=None):
+        past_key_values = self.past_key_values
+
+        selected_cache = []
+
+        # TODO: layer offset
+        for layer_idx in range(len(past_key_values)):
+            if layer_idx < self.skip_layers:
+                selected_cache.append(past_key_values[layer_idx])
+                continue
+
+            k, v = past_key_values[layer_idx]
+
+            offset = max(self.block_size * layer_idx - self.block_size//2, 0)
+            step = self.block_size * len(past_key_values) // 2
+            scope = self.block_size
+
+            layer_selected_k = k[:, :, 0: self.budget_size, :]
+            layer_selected_v = v[:, :, 0: self.budget_size, :]
+
+            selected_cache.append([layer_selected_k, layer_selected_v])
+
+        return selected_cache
+
+class SnapCache:
+    def __init__(
+        self,
+        block_size,
+        skip_layers,
+        budget_size,
+        model,
+        k_seq_dim=2,
+        v_seq_dim=2,
+    ):
+        self.block_size = block_size
+        self.skip_layers = skip_layers
+        self.budget_size = budget_size
+        self.model = model
+
+        self.k_seq_dim = k_seq_dim
+        self.v_seq_dim = v_seq_dim
+        self.k_slice = DIM_TO_SLICE[k_seq_dim]
+        self.v_slice = DIM_TO_SLICE[v_seq_dim]
+        self.past_key_values = []
+
+    # def update(self, past_key_values, new_cache_len):
+    #     self.past_key_values = past_key_values
+
+    def update(self, past_key_values, new_cache_len):
+        # update local kv cache
+        if len(self.past_key_values) == 0:
+            # TODO: slow update
+            for layer_idx, (k, v) in enumerate(past_key_values):
+                self.past_key_values.append([k, v])
+        else:
+            for layer_idx, (k, v) in enumerate(past_key_values):
+                self.past_key_values[layer_idx] = [
+                    torch.cat([self.past_key_values[layer_idx][0], k[:,:,-new_cache_len:,:]], dim=self.k_seq_dim),
+                    torch.cat([self.past_key_values[layer_idx][1], v[:,:,-new_cache_len:,:]], dim=self.v_seq_dim)
+                ]
+
+    def __call__(self, past_key_values, query=None):
+        past_key_values = self.past_key_values
+
+        selected_cache = []
+
+        qlen = query.size(-2)
+
+        # TODO: bottleneck
+        replace_naive_attention(self.model)
+        # attn_score.shape = bs, num_heads, qlen, klen
+        attn_score = self.model(
+            query,
+            past_key_values=past_key_values,
+            use_cache=True,
+            output_attentions=True,
+        ).attentions
+        replace_flash_attention(self.model)
+
+        for layer_idx in range(len(past_key_values)):
+            if layer_idx < self.skip_layers:
+                selected_cache.append(past_key_values[layer_idx])
+                continue
+            k, v = past_key_values[layer_idx]
+            bs, head_num, seq_len, head_dim = k.shape
+
+            kernel_size = 7
+            window_size = 32
+            layer_attn_score = attn_score[layer_idx].sum(dim=-2)[..., :-(qlen + window_size)]
+            # layer_attn_score = v[:,:,:-window_size,:].max(dim=-1).values
+            # TODO: hard code
+            layer_attn_score = F.avg_pool1d(layer_attn_score, kernel_size = kernel_size, padding=kernel_size//2, stride=1)
+
+            indices = layer_attn_score.topk(self.budget_size - window_size, dim=-1).indices
+            indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+
+            k_past_compress = k[:, :, :-window_size, :].gather(dim = 2, index = indices)
+            v_past_compress = v[:, :, :-window_size, :].gather(dim = 2, index = indices)
+            k_cur = k[:, :, -window_size:, :]
+            v_cur = v[:, :, -window_size:, :]
+
+            key_states = torch.cat([k_past_compress, k_cur], dim = 2)
+            value_states = torch.cat([v_past_compress, v_cur], dim = 2)
+            selected_cache.append([key_states, value_states])
+
+        return selected_cache

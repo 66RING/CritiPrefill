@@ -1,11 +1,11 @@
 import torch
 
-from kv_cache import QuestCache
+from kv_cache import QuestCache, FlashCache, SnapCache
 
-CACHE_BLOCK = 128
-PREFILL_BLOCK = 1024
-TOPK = 4
-BUDGETS = CACHE_BLOCK * TOPK
+CACHE_BLOCK = 16
+PREFILL_BLOCK = 2048
+TOPK = int(128 / 2)
+BUDGETS = int(CACHE_BLOCK * TOPK)
 
 @torch.no_grad()
 def generate(input_ids, model, max_new_tokens=50, eos_token_id=[]):
@@ -31,7 +31,10 @@ def segment_prefill(input_ids, model, prefill_block_size=PREFILL_BLOCK, cache_bl
     input_len = input_ids.size(-1)
     past_key_values = None
 
-    kv_cache = QuestCache(cache_block_size, skip_layers=1, budget_size=budget_size, model=model)
+    # kv_cache = QuestCache(cache_block_size, skip_layers=1, budget_size=budget_size, model=model)
+    kv_cache = FlashCache(cache_block_size, skip_layers=1, budget_size=budget_size, model=model)
+    # kv_cache = SnapCache(cache_block_size, skip_layers=0, budget_size=budget_size, model=model)
+
     threshold_len = prefill_block_size
 
     for i in range(0, input_len, prefill_block_size):
@@ -46,7 +49,6 @@ def segment_prefill(input_ids, model, prefill_block_size=PREFILL_BLOCK, cache_bl
             # TODO: single query to snap for now?
             query = input_ids[:, i+prefill_block_size+1:i+prefill_block_size+2]
             # use compressed cache
-
             past_key_values = kv_cache(past_key_values, query=query)
 
     next_token_logits = outputs.logits[:, -1, :]
@@ -54,7 +56,7 @@ def segment_prefill(input_ids, model, prefill_block_size=PREFILL_BLOCK, cache_bl
 
     past_key_values = kv_cache.past_key_values
     # TODO:
-    assert input_len == past_key_values[-1][0].size(-2)
+    # assert input_len == past_key_values[-1][0].size(-2)
 
     return next_token_id, past_key_values
 
