@@ -12,6 +12,35 @@ from transformers.models.llama.modeling_llama import (
     repeat_kv,
 )
 
+class ECache:
+    def __init__(self, bsz, num_heads, head_dim, device, dtype):
+        self.max_key_cache = torch.empty((bsz, num_heads, 0, head_dim), device=device, dtype=dtype)
+        self.min_key_cache = torch.empty((bsz, num_heads, 0, head_dim), device=device, dtype=dtype)
+
+    def update(self, key_states, block_size):
+        '''
+        key_states shape = (bsz, len, num_heads, head_dim)
+
+        return shape = (bsz, num_heads, len, head_dim)
+        '''
+        bsz, _, head_num, head_dim = key_states.shape
+        key_states = key_states.transpose(1, 2)
+        key_len = key_states.size(2)
+        key_candidate_len = key_len // block_size
+        if key_candidate_len <= self.max_key_cache.size(2):
+            return self.max_key_cache, self.min_key_cache
+
+        pooling = nn.MaxPool1d(block_size, stride=block_size)
+        new_cache_len = int((key_candidate_len - self.max_key_cache.size(2)) * block_size)
+        key_states = key_states[:,:,-new_cache_len:].view(bsz * head_num, -1, head_dim).transpose(-1, -2)
+        new_max_key_cache = pooling(key_states)
+        new_min_key_cache = pooling(key_states * -1) * -1
+        new_max_key_cache = new_max_key_cache.transpose(-1, -2).view(bsz, head_num, -1, head_dim)
+        new_min_key_cache = new_min_key_cache.transpose(-1, -2).view(bsz, head_num, -1, head_dim)
+        self.max_key_cache = torch.cat([self.max_key_cache, new_max_key_cache], dim=2)
+        self.min_key_cache = torch.cat([self.min_key_cache, new_min_key_cache], dim=2)
+        return self.max_key_cache, self.min_key_cache
+
 def llama_attn_forward(
     self,
     hidden_states: torch.Tensor,
@@ -182,6 +211,44 @@ def llama_eattention_forward(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
     import nvtx
+    def profiling(future_query_states, key_states, value_states):
+        import wandb
+        import numpy as np
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        # (bs, head, qlen, klen) => (head, klen)
+        qk = torch.matmul(future_query_states, key_states.transpose(2, 3))
+        attn_score = qk.mean(dim=-2).mean(dim=0)
+
+        # (bs, head, klen, dim) => (head, klen)
+        v_mean_score = value_states.mean(dim=-1).mean(dim=0)
+
+        # (bs, head, klen, dim) => (head, klen)
+        v_max_score = value_states.max(dim=-1).values.mean(dim=0)
+        
+        v_min_score = value_states.min(dim=-1).values.mean(dim=0)
+
+        assert attn_score.size() == v_mean_score.size() == v_max_score.size() == v_min_score.size(), f"{attn_score.shape}, {v_mean_score.shape}, {v_max_score.shape}"
+        for hi in range(attn_score.size(0)):
+            # for topk in [1024, 512, 256, 128, 64, 32, 16, 8]:
+            for topk in [8]:
+                base_topk = attn_score[hi].topk(topk).indices.sort().values.cpu()
+                v_mean_topk = v_mean_score[hi].topk(topk).indices.sort().values.cpu()
+                v_max_topk = v_max_score[hi].topk(topk).indices.sort().values.cpu()
+                v_min_topk = v_min_score[hi].topk(topk).indices.sort().values.cpu()
+                print(base_topk)
+                print(len(np.intersect1d(v_mean_topk, base_topk)), v_mean_topk)
+                print(len(np.intersect1d(v_max_topk, base_topk)), v_max_topk)
+                print(len(np.intersect1d(v_min_topk, base_topk)), v_min_topk)
+                # print(len(np.intersect1d(v_mean_topk, base_topk)))
+                # print(len(np.intersect1d(v_max_topk, base_topk)))
+                # print(len(np.intersect1d(v_min_topk, base_topk)))
+                input()
+
+                pass
+
+
     def cache_compress(future_query_states, key_states, value_states, cache_len, block_size, budget_size, stay_size):
         # copy_old_rng = nvtx.start_range("copy old")
         # nvtx.end_range(copy_old_rng)
@@ -223,18 +290,26 @@ def llama_eattention_forward(
         # # NOTE: here q,k,v shape = (bsz, num_heads, len, head_dim)
 
 
-        # algo 3 pooling
+        # # algo 3 pooling
+        # future_query_states = future_query_states.transpose(1, 2)
+        # layer_block_max_k = key_states.transpose(1, 2)
+        # layer_block_min_k = layer_block_max_k
+        # import torch.nn
+        # pool_len = (cache_len - stay_size)//block_size * block_size
+        # pooling = nn.MaxPool1d(block_size, stride=block_size)
+        # layer_block_max_k = pooling(layer_block_max_k[:,:,:pool_len].view(bsz * head_num, -1, head_dim).transpose(-1, -2))
+        # layer_block_min_k = pooling(layer_block_min_k[:,:,:pool_len].view(bsz * head_num, -1, head_dim).transpose(-1, -2) * -1) * -1
+        # left_over = cache_len - pool_len
+        # layer_block_max_k = layer_block_max_k.transpose(-1, -2).view(bsz, head_num, -1, head_dim)
+        # layer_block_min_k = layer_block_min_k.transpose(-1, -2).view(bsz, head_num, -1, head_dim)
+
+
+        # algo 4: streaming, 最后一个block始终保留, 之前的block使用缓存
         future_query_states = future_query_states.transpose(1, 2)
-        layer_block_max_k = key_states.transpose(1, 2)
-        layer_block_min_k = layer_block_max_k
-        import torch.nn
+        # # NOTE: here q,k,v shape = (bsz, len, num_heads, head_dim)
         pool_len = (cache_len - stay_size)//block_size * block_size
-        pooling = nn.MaxPool1d(block_size, stride=block_size)
-        layer_block_max_k = pooling(layer_block_max_k[:,:,:pool_len].view(bsz * head_num, -1, head_dim).transpose(-1, -2))
-        layer_block_min_k = pooling(layer_block_min_k[:,:,:pool_len].view(bsz * head_num, -1, head_dim).transpose(-1, -2) * -1) * -1
         left_over = cache_len - pool_len
-        layer_block_max_k = layer_block_max_k.transpose(-1, -2).view(bsz, head_num, -1, head_dim)
-        layer_block_min_k = layer_block_min_k.transpose(-1, -2).view(bsz, head_num, -1, head_dim)
+        layer_block_max_k, layer_block_min_k = self.eattn_cache.update(key_states[:, :pool_len], block_size)
 
 
         # shape = (bsz, num_heads, future_q_len, block_nums)
@@ -242,7 +317,7 @@ def llama_eattention_forward(
         attn_weights_min = torch.matmul(future_query_states, layer_block_min_k.transpose(2, 3))
 
         # shape = (bsz, num_heads, block_nums)
-        # NOTE: max pooling along the future_q_len
+        # NOTE: max/min pooling along the future_q_len
         attn_weights_max = attn_weights_max.max(dim=2).values
         attn_weights_min = attn_weights_min.min(dim=2).values
         channel_max = torch.max(attn_weights_min, attn_weights_max)
@@ -259,6 +334,8 @@ def llama_eattention_forward(
         index = index.view(bsz, head_num, -1).transpose(1, 2)
 
         # TODO: always keep last segment?? and sink token?
+
+        # profiling(future_query_states, key_states, value_states)
 
         layer_selected_k = torch.gather(key_states, dim=1, index=index.unsqueeze(-1).expand(-1, -1, -1, head_dim))
         layer_selected_v = torch.gather(value_states, dim=1, index=index.unsqueeze(-1).expand(-1, -1, -1, head_dim))
@@ -361,18 +438,22 @@ def llama_eattention_forward(
         key_states = key_states.to(target_dtype)
         value_states = value_states.to(target_dtype)
 
+    # init lookup table
+    if is_prefill:
+        self.eattn_cache = ECache(bsz, self.num_heads, self.head_dim, device=query_states.device, dtype=query_states.dtype)
+
     # if is_prefill and self.layer_idx > 0:
     if self.layer_idx > 0:
         # TODO: hard code for now
-        segment_size = 1024 * 2
-        threshold_len = 1024 * 4
-        block_size = 16
-        budgets = 512
+        # segment_size = 1024 * 2
+        # threshold_len = 1024 * 4
+        # block_size = 16
+        # budgets = 512
 
-        # segment_size = 1024
-        # threshold_len = 1024
-        # block_size = 4
-        # budgets = 128
+        segment_size = 1024
+        threshold_len = 1024
+        block_size = 16
+        budgets = 128
         attn_output = eattention(segment_size, threshold_len, budgets, block_size, query_states, key_states, value_states)
     else:
         attn_output = self._flash_attention_forward(
