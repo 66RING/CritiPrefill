@@ -211,6 +211,7 @@ def llama_eattention_forward(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
     import nvtx
+    import os
     def profiling(future_query_states, key_states, value_states):
         import wandb
         import numpy as np
@@ -310,7 +311,7 @@ def llama_eattention_forward(
         pool_len = (cache_len - stay_size)//block_size * block_size
         left_over = cache_len - pool_len
         layer_block_max_k, layer_block_min_k = self.eattn_cache.update(key_states[:, :pool_len], block_size)
-
+        assert layer_block_max_k.size(2)  * block_size == pool_len
 
         # shape = (bsz, num_heads, future_q_len, block_nums)
         attn_weights_max = torch.matmul(future_query_states, layer_block_max_k.transpose(2, 3))
@@ -319,26 +320,44 @@ def llama_eattention_forward(
         # shape = (bsz, num_heads, block_nums)
         # NOTE: max/min pooling along the future_q_len
         attn_weights_max = attn_weights_max.max(dim=2).values
-        attn_weights_min = attn_weights_min.min(dim=2).values
+        attn_weights_min = attn_weights_min.max(dim=2).values
+        # attn_weights_max = attn_weights_max.mean(dim=2)
+        # attn_weights_min = attn_weights_min.mean(dim=2)
         channel_max = torch.max(attn_weights_min, attn_weights_max)
 
         # TODO: -1
         topk = budget_size // block_size - 1
         index = torch.topk(channel_max, topk, dim=-1).indices
 
-        max_block_num = channel_max.size(-1)
-        r = torch.arange(0, max_block_num * block_size, device=device)[None, None, :]
-        r = r.expand(bsz, head_num, max_block_num * block_size).view(bsz, head_num, max_block_num, block_size)
-
-        index = torch.gather(r, 2, index.unsqueeze(-1).expand(-1, -1, -1, block_size))
-        index = index.view(bsz, head_num, -1).transpose(1, 2)
-
         # TODO: always keep last segment?? and sink token?
 
         # profiling(future_query_states, key_states, value_states)
 
-        layer_selected_k = torch.gather(key_states, dim=1, index=index.unsqueeze(-1).expand(-1, -1, -1, head_dim))
-        layer_selected_v = torch.gather(value_states, dim=1, index=index.unsqueeze(-1).expand(-1, -1, -1, head_dim))
+        def block_selection(key_states, value_states, index):
+            # # index.shape = (bsz, num_heads, block_nums)
+            # # key_states.shape = (bsz, len, num_heads, head_dim)
+            # key_states = key_states.transpose(1, 2).view(bsz, head_num, -1, block_size, head_dim)
+            # value_states = value_states.transpose(1, 2).view(bsz, head_num, -1, block_size, head_dim)
+            # index = index.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, block_size, head_dim)
+
+            # selected_k = torch.gather(key_states, dim=2, index=index)
+            # selected_v = torch.gather(value_states, dim=2, index=index)
+            # selected_k = selected_k.view(bsz, head_num, -1, head_dim).transpose(1, 2)
+            # selected_v = selected_v.view(bsz, head_num, -1, head_dim).transpose(1, 2)
+            # return selected_k, selected_v
+
+            key_states = key_states.view(bsz, -1, block_size, head_num, head_dim)
+            value_states = value_states.view(bsz, -1, block_size, head_num , head_dim)
+            index = index.transpose(1, 2).unsqueeze(2).unsqueeze(-1).expand(bsz, -1, block_size, head_num , head_dim)
+
+            selected_k = torch.gather(key_states, dim=1, index=index)
+            selected_v = torch.gather(value_states, dim=1, index=index)
+            selected_k = selected_k.view(bsz, -1, head_num, head_dim)
+            selected_v = selected_v.view(bsz, -1, head_num, head_dim)
+            return selected_k, selected_v
+
+        layer_selected_k, layer_selected_v = block_selection(key_states[:, :pool_len], value_states[:, :pool_len], index)
+
         layer_selected_k = torch.cat([layer_selected_k, key_states[:, -left_over:]], dim=1)
         layer_selected_v = torch.cat([layer_selected_v, value_states[:, -left_over:]], dim=1)
         return layer_selected_k, layer_selected_v
@@ -351,6 +370,7 @@ def llama_eattention_forward(
         input_len = query_states.size(1)
         if input_len == 1:
             # decoding
+            # TODO: decoding bug
             cache_len = key_states.size(1)
             key_states, value_states = cache_compress(query_states, key_states, value_states, cache_len, block_size, budgets, block_size)
             attn_output = flash_attn_func(
@@ -442,18 +462,19 @@ def llama_eattention_forward(
     if is_prefill:
         self.eattn_cache = ECache(bsz, self.num_heads, self.head_dim, device=query_states.device, dtype=query_states.dtype)
 
-    # if is_prefill and self.layer_idx > 0:
-    if self.layer_idx > 0:
-        # TODO: hard code for now
-        # segment_size = 1024 * 2
-        # threshold_len = 1024 * 4
-        # block_size = 16
-        # budgets = 512
+    prefill_only = os.environ.get('PREFILL_ONLY', '0') == '1'
+    do_eattn = True
+    if prefill_only and not is_prefill:
+        do_eattn = False
 
-        segment_size = 1024
-        threshold_len = 1024
-        block_size = 16
-        budgets = 128
+    # if is_prefill and self.layer_idx > 0:
+    if self.layer_idx > 0 and do_eattn:
+        # TODO: hard code for now
+        segment_size = int(os.environ.get('SEG_SIZE', '4096'))
+        threshold_len = int(os.environ.get('SEG_START', '4096'))
+        block_size = int(os.environ.get('BLOCK_SIZE', '32'))
+        budgets = int(os.environ.get('BUDGETS', '512'))
+
         attn_output = eattention(segment_size, threshold_len, budgets, block_size, query_states, key_states, value_states)
     else:
         attn_output = self._flash_attention_forward(
