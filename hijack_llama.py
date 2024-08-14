@@ -251,6 +251,81 @@ def llama_eattention_forward(
 
 
     def cache_compress(future_query_states, key_states, value_states, cache_len, block_size, budget_size, stay_size):
+        # simply top k
+        bsz, _, head_num, head_dim = key_states.shape
+        q_head_num = future_query_states.size(-2)
+        num_key_value_groups = q_head_num // head_num
+
+        future_query_states = future_query_states.transpose(1, 2)
+        layer_block_max_k = key_states.transpose(1, 2)[:,:,:-stay_size]
+        left_over = stay_size
+        import torch.nn
+        import torch
+
+        v = value_states.transpose(1, 2)[:,:,:-stay_size]
+        v = repeat_kv(v, num_key_value_groups)
+        vnorm = torch.norm(v, dim=-1)
+
+
+        '''
+        TODO:
+            q 1 -> 10有质变
+            再大效果不明显
+
+            1. vnorm, 决定token的重要程度, query无关
+                attn_score, 是query相关的token重要程度, 而value是query无关的
+                对比sg512_q10, 几乎没有变化
+            2. snapkv的pooling对预测效果的提升
+                pooling会让l1 loss变大
+            3. 分block的应该有一样的现象
+        '''
+
+        layer_block_max_k = repeat_kv(layer_block_max_k, num_key_value_groups)
+
+        # shape = (bsz, num_heads, future_q_len, block_nums)
+        attn_weights_max = torch.matmul(future_query_states, layer_block_max_k.transpose(2, 3))
+        channel_max = attn_weights_max.mean(dim=2)
+
+        # TODO: -1
+        topk = budget_size
+        # topk = int(channel_max.size(-1) * 0.5)
+        # topk = 10
+        # print("B=", topk)
+        # index = torch.topk(channel_max, topk, dim=-1).indices
+        channel_max = nn.functional.softmax(channel_max, dim=-1, dtype=torch.float32).to(key_states.dtype)
+
+        # print(attn_weights_max.shape)
+        # print(vnorm.shape)
+        # input()
+        channel_max = channel_max.view(bsz, head_num, num_key_value_groups, -1).mean(dim=-2)
+
+        # kernel_size = 7
+        # channel_max = nn.functional.avg_pool1d(channel_max, kernel_size=kernel_size, padding=kernel_size//2, stride=1)
+
+        value, index = torch.topk(channel_max, topk, dim=-1)
+        # # print(value)
+        # print(value.sum(dim=-1))
+        # print("acc mean", value.sum(dim=-1).mean().item())
+        index = index.transpose(1, 2).unsqueeze(-1).expand(-1, -1, -1, head_dim)
+
+        selected_k = torch.gather(key_states, dim=1, index=index)
+        selected_v = torch.gather(value_states, dim=1, index=index)
+        selected_k = selected_k.view(bsz, -1, head_num, head_dim)
+        selected_v = selected_v.view(bsz, -1, head_num, head_dim)
+
+        # layer_selected_k, layer_selected_v = block_selection(key_states[:, :pool_len], value_states[:, :pool_len], index)
+
+        layer_selected_k = torch.cat([selected_k, key_states[:, -left_over:]], dim=1)
+        layer_selected_v = torch.cat([selected_v, value_states[:, -left_over:]], dim=1)
+        return layer_selected_k, layer_selected_v
+
+
+        ################################
+
+
+
+
+
         # copy_old_rng = nvtx.start_range("copy old")
         # nvtx.end_range(copy_old_rng)
 
@@ -259,7 +334,10 @@ def llama_eattention_forward(
         # q,k,v shape = (bsz, len, num_heads, head_dim)
         assert block_size <= stay_size
 
-        bsz, future_q_len, head_num, head_dim = future_query_states.shape
+        bsz, future_q_len, q_head_num, head_dim = future_query_states.shape
+        bsz, _, head_num, head_dim = key_states.shape
+        num_key_value_groups = q_head_num // head_num
+
         device = future_query_states.device
         layer_block_max_k = []
         layer_block_min_k = []
@@ -280,15 +358,17 @@ def llama_eattention_forward(
         #     layer_block_min_k.append(key_states[:, start_index:end_index].min(dim=1, keepdim=True).values)
 
 
-        # # algo 2
-        # layer_block_max_k = key_states[:,:(cache_len - stay_size)//block_size]
-        # layer_block_min_k = key_states[:,:(cache_len - stay_size)//block_size]
-        # left_over = cache_len - (cache_len - stay_size)//block_size * block_size
+        # algo 2
+        layer_block_max_k = key_states[:,:(cache_len - stay_size)//block_size]
+        layer_block_min_k = key_states[:,:(cache_len - stay_size)//block_size]
+        pool_len = (cache_len - stay_size)//block_size * block_size
+        left_over = cache_len - (cache_len - stay_size)//block_size * block_size
 
-        # future_query_states = future_query_states.transpose(1, 2)
-        # layer_block_max_k = layer_block_max_k.transpose(1, 2)
-        # layer_block_min_k = layer_block_min_k.transpose(1, 2)
-        # # NOTE: here q,k,v shape = (bsz, num_heads, len, head_dim)
+        future_query_states = future_query_states.transpose(1, 2)
+        layer_block_max_k = layer_block_max_k.transpose(1, 2)
+        layer_block_min_k = layer_block_min_k.transpose(1, 2)
+        # NOTE: here q,k,v shape = (bsz, num_heads, len, head_dim)
+
 
 
         # # algo 3 pooling
@@ -305,13 +385,19 @@ def llama_eattention_forward(
         # layer_block_min_k = layer_block_min_k.transpose(-1, -2).view(bsz, head_num, -1, head_dim)
 
 
-        # algo 4: streaming, 最后一个block始终保留, 之前的block使用缓存
-        future_query_states = future_query_states.transpose(1, 2)
-        # # NOTE: here q,k,v shape = (bsz, len, num_heads, head_dim)
-        pool_len = (cache_len - stay_size)//block_size * block_size
-        left_over = cache_len - pool_len
-        layer_block_max_k, layer_block_min_k = self.eattn_cache.update(key_states[:, :pool_len], block_size)
-        assert layer_block_max_k.size(2)  * block_size == pool_len
+
+        # # algo 4: streaming, 最后一个block始终保留, 之前的block使用缓存
+        # future_query_states = future_query_states.transpose(1, 2)
+        # # # NOTE: here q,k,v shape = (bsz, len, num_heads, head_dim)
+        # pool_len = (cache_len - stay_size)//block_size * block_size
+        # left_over = cache_len - pool_len
+        # layer_block_max_k, layer_block_min_k = self.eattn_cache.update(key_states[:, :pool_len], block_size)
+        # assert layer_block_max_k.size(2)  * block_size == pool_len
+
+
+        # GQA support
+        layer_block_max_k = repeat_kv(layer_block_max_k, num_key_value_groups)
+        layer_block_min_k = repeat_kv(layer_block_min_k, num_key_value_groups)
 
         # shape = (bsz, num_heads, future_q_len, block_nums)
         attn_weights_max = torch.matmul(future_query_states, layer_block_max_k.transpose(2, 3))
@@ -319,11 +405,14 @@ def llama_eattention_forward(
 
         # shape = (bsz, num_heads, block_nums)
         # NOTE: max/min pooling along the future_q_len
-        attn_weights_max = attn_weights_max.max(dim=2).values
-        attn_weights_min = attn_weights_min.max(dim=2).values
-        # attn_weights_max = attn_weights_max.mean(dim=2)
-        # attn_weights_min = attn_weights_min.mean(dim=2)
+        # attn_weights_max = attn_weights_max.max(dim=2).values
+        # attn_weights_min = attn_weights_min.max(dim=2).values
+        attn_weights_max = attn_weights_max.mean(dim=2)
+        attn_weights_min = attn_weights_min.mean(dim=2)
         channel_max = torch.max(attn_weights_min, attn_weights_max)
+
+        # GQA support
+        channel_max = channel_max.view(bsz, head_num, num_key_value_groups, -1).mean(dim=-2)
 
         # TODO: -1
         topk = budget_size // block_size - 1
@@ -365,6 +454,7 @@ def llama_eattention_forward(
 
     def eattention(segment_size, threshold_len, budgets, block_size, query_states, key_states, value_states):
         from flash_attn import flash_attn_func
+        import wandb
         # NOTE: q,k,v shape = (bsz, len, num_heads, head_dim)
 
         input_len = query_states.size(1)
@@ -383,15 +473,39 @@ def llama_eattention_forward(
                 q_segment = query_states[:, i:i+segment_size,:,:]
                 k_segment = key_states[:, :i+segment_size,:,:]
                 v_segment = value_states[:, :i+segment_size,:,:]
-                if i > threshold_len or input_len == 1:
+                org_attn_out = flash_attn_func(
+                    q_segment, k_segment, v_segment, causal=True
+                )
+
+                if i >= threshold_len and i + segment_size < input_len:
+                    # NOTE: keep last block full len
+
+                    # future_q = q_segment[:, 0::segment_size//100, :]
                     future_q = q_segment[:, 0::segment_size//10, :]
+                    # future_q = q_segment[:, :1, :]
+                    # future_q = q_segment
+
                     cache_len = k_segment.size(1)
                     k_segment, v_segment = cache_compress(future_q, k_segment, v_segment, cache_len, block_size, budgets, segment_size)
 
                 attn_output = flash_attn_func(
                     q_segment, k_segment, v_segment, causal=True
                 )
+
+                if i >= threshold_len and i + segment_size < input_len and i % 2048 == 0:
+                    gap_attn_output = attn_output - org_attn_out
+                    L1_gap = torch.norm(gap_attn_output, p=1, dim=-1)
+                    L1_base = torch.norm(org_attn_out, p=1, dim=-1)
+                    L1_gap = L1_gap / L1_base
+                    for h in range(L1_gap.size(2)):
+                        wandb.log({f"Layer{self.layer_idx}_h{h}": L1_gap[0, :, h].mean().item()}, commit=True)
+                    # print(L1_gap.shape)
+                    # print(L1_gap)
+                    # input()
+                    # wandb.log({f"Layer{self.layer_idx}": L1_gap.item()}, commit=True)
+
                 attn_outputs.append(attn_output)
+
 
             attn_output = torch.cat(attn_outputs, dim=1)
         return attn_output
@@ -460,7 +574,7 @@ def llama_eattention_forward(
 
     # init lookup table
     if is_prefill:
-        self.eattn_cache = ECache(bsz, self.num_heads, self.head_dim, device=query_states.device, dtype=query_states.dtype)
+        self.eattn_cache = ECache(bsz, self.num_key_value_heads, self.head_dim, device=query_states.device, dtype=query_states.dtype)
 
     prefill_only = os.environ.get('PREFILL_ONLY', '0') == '1'
     do_eattn = True
