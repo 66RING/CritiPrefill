@@ -97,7 +97,7 @@ if __name__ == '__main__':
             with open(f"{path}{filename}", "r", encoding="utf-8") as f:
                 for line in f:
                     data = json.loads(line)
-                    predictions.append(data["pred"])
+                    predictions.append(data["pred"][:data["pred"].find("\n\n")])
                     answers.append(data["answers"])
                     all_classes = data["all_classes"]
                     if "length" in data:
