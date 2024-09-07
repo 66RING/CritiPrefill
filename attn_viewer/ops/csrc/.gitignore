@@ -2,3 +2,5 @@ build/
 deps/
 tiny_pkg.egg-info/
 test.py
+interset_tools.egg-info/
+dist/
