@@ -3,3 +3,4 @@ __pycache__
 ignore/
 wandb
 *.pkl
+attn_viewer/*.png
