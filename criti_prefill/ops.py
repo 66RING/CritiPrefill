@@ -1,18 +1,14 @@
 import torch
 import torch.nn.functional as F
-import os
 from transformers.models.llama.modeling_llama import (
     repeat_kv,
 )
-
 
 def cache_profilling(fwd_obj, query_states, key_states, block_size, budget_size, segment_size):
     '''
     q,k (bs, seqlen, num_heads, head_dim)
     return index shape = (bs, num_heads, num_segments, topk)
     '''
-
-    # TODO: q sampling from outside
 
     assert segment_size >= block_size
 
@@ -21,9 +17,6 @@ def cache_profilling(fwd_obj, query_states, key_states, block_size, budget_size,
     num_heads_k = key_states.size(-2)
     num_key_value_groups = num_heads // num_heads_k
     nrep = segment_size // block_size
-
-    # TODO: always keep last segment
-    stay_size = segment_size
 
     num_segments = (seqlen + segment_size - 1) // segment_size
     pool_len = (num_segments - 1) * segment_size
@@ -39,8 +32,6 @@ def cache_profilling(fwd_obj, query_states, key_states, block_size, budget_size,
     key_states = repeat_kv(key_states, num_key_value_groups)
     key_states = key_states.reshape(bsz, num_heads, pool_len//block_size, block_size, head_dim)
 
-
-
     # (bs, num_heads, block_num, head_dim)
     layer_max_q = query_states.max(dim=-2).values
     layer_max_k = key_states.max(dim=-2).values
@@ -48,12 +39,6 @@ def cache_profilling(fwd_obj, query_states, key_states, block_size, budget_size,
     layer_min_k = key_states.min(dim=-2).values
 
     # (bs, num_heads, seg_num_q, block_num_k)
-    # # NOTE: method 1: global max min
-    # attn_weights_max = torch.matmul(layer_max_q, layer_max_k.transpose(2, 3))
-    # attn_weights_min = torch.matmul(layer_min_q, layer_min_k.transpose(2, 3))
-    # attn_weights = torch.max(attn_weights_max, attn_weights_min)
-
-    # NOTE: method 2: local query max min
     q_block_len = layer_max_q.size(-2)
     k_block_len = layer_max_k.size(-2)
     qq = torch.cat([layer_max_q, layer_min_q], dim=-2)
@@ -61,19 +46,8 @@ def cache_profilling(fwd_obj, query_states, key_states, block_size, budget_size,
     attn_weights_min = torch.matmul(qq, layer_min_k.transpose(2, 3)).view(bsz, num_heads, 2, q_block_len, k_block_len).mean(dim=2)
     attn_weights = torch.max(attn_weights_max, attn_weights_min)
 
-
-    # layer_max_q = query_states.mean(dim=-2)
-    # layer_max_k = key_states.max(dim=-2).values
-    # layer_min_k = key_states.min(dim=-2).values
-    # attn_weights_max = torch.matmul(layer_max_q, layer_max_k.transpose(2, 3))
-    # attn_weights_min = torch.matmul(layer_max_q, layer_min_k.transpose(2, 3))
-    # attn_weights = torch.max(attn_weights_max, attn_weights_min)
-
-
     # GQA support
     attn_weights = attn_weights.view(bsz, num_heads_k, num_key_value_groups, num_segments, num_blocks).mean(dim=2)
-
-    # TODO: attn mask
 
     mask = torch.full((num_blocks, num_blocks), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
     mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
@@ -83,7 +57,6 @@ def cache_profilling(fwd_obj, query_states, key_states, block_size, budget_size,
     mask = mask.to(attn_weights.device).view(num_segments, nrep, num_blocks)[:, -1, :]
     attn_weights += mask[None, None, :, :]
 
-    # TODO: softmax
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(key_states.dtype)
 
     if fwd_obj.layer_fusion == True:
@@ -96,8 +69,6 @@ def cache_profilling(fwd_obj, query_states, key_states, block_size, budget_size,
             attn_weights = fwd_obj._g.prev_attn_weights.to(cdevice) * pprev + attn_weights * pcurr
             fwd_obj._g.prev_attn_weights = attn_weights
 
-    # attn_weights = attn_weights.mean(dim=2)
-
     topk = budget_size // block_size
     index = torch.topk(attn_weights, topk, dim=-1).indices
 
@@ -109,9 +80,6 @@ def cache_selection(key_states, value_states, index, block_size, left_over):
     index.shape = (bs, num_heads, topk)
     '''
     bsz, seqlen, num_head, head_dim = key_states.shape
-
-    # key_states = key_states.view(bsz, -1, block_size, num_head, head_dim)
-    # value_states = value_states.view(bsz, -1, block_size, num_head , head_dim)
 
     index = index.transpose(1, 2).unsqueeze(2).unsqueeze(-1).expand(bsz, -1, block_size, num_head , head_dim)
 
@@ -130,11 +98,6 @@ def eattention(fwd_obj, segment_size, threshold_len, budgets, block_size, query_
     from flash_attn import flash_attn_func
     # NOTE: q,k,v shape = (bsz, len, num_heads, head_dim)
 
-    # TODO: prev layer history
-    # past_key_value.prev_channel_max = None
-
-    # TODO: profilling importent block
-
     # index.shape = (bs, num_heads, num_segments, topk)
     block_index = cache_profilling(fwd_obj, query_states, key_states, block_size, budgets, segment_size)
 
@@ -151,8 +114,7 @@ def eattention(fwd_obj, segment_size, threshold_len, budgets, block_size, query_
             v_segment = value_states[:, :i+segment_size,:,:]
 
             if i >= threshold_len and i + segment_size < input_len:
-                # # NOTE: keep last block full len
-
+                # NOTE: keep last block full len
                 curr_segment = i // segment_size
                 index = block_index[:, :, curr_segment, :]
                 k_segment, v_segment = cache_selection(k_segment, v_segment, index, block_size, segment_size)
@@ -162,7 +124,6 @@ def eattention(fwd_obj, segment_size, threshold_len, budgets, block_size, query_
             )
 
             attn_outputs.append(attn_output)
-
 
         attn_output = torch.cat(attn_outputs, dim=1)
     return attn_output
