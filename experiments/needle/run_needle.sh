@@ -19,7 +19,7 @@ for MODEL_NAME in "${MODEL_NAMES[@]}"; do
 SEG_SIZE=512
 SEG_START=4096
 BLOCK_SIZE=32
-BUDGETS=1024
+BUDGETS=2048
 VNAME=ssize${SEG_SIZE}_sstart${SEG_START}_bsize${BLOCK_SIZE}_budget${BUDGETS}_layer_fusion_on_${VNAME_EXT}
 METHOD="-eattn"
   python -u run_needle_in_haystack.py --s_len $START --e_len $END \
@@ -36,7 +36,6 @@ METHOD="-eattn"
 
 VNAME=base_${VNAME_EXT}
 METHOD=""
-  # TODO: HUG there
   python -u run_needle_in_haystack.py --s_len $START --e_len $END \
       --model_name $MODELS_DIR/${MODEL_NAME} \
       --attn_implementation flash_attention_2 \

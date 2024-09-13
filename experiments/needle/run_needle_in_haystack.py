@@ -156,7 +156,6 @@ class LLMNeedleHaystackTester:
                                                                     torch_dtype=torch.bfloat16,
                                                                     low_cpu_mem_usage=True,
                                                                     device_map="auto",
-                                                                    use_cache=False, 
                                                                     attn_implementation=attn_implementation
                                                                 )
 
