@@ -4,12 +4,9 @@ START=4096
 END=140000
 STEP=4096
 
-# TODO: review layer fusion default value
-
 MODEL_NAMES=(
-  # "Llama-3-8B-Instruct-Gradient-1048k"
+  "Llama-3-8B-Instruct-Gradient-1048k"
   # "Yi-9B-200K"
-  "tinyllama-110M"
 )
 
 VNAME_EXT=""
