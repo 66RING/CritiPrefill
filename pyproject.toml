@@ -7,6 +7,7 @@ name = "criti_prefill"
 version = "0.0.1"
 
 dependencies = [
+    "rouge",
     "tokenizers",
     "rouge_score",
     "jieba==0.42.1",
