@@ -9,7 +9,7 @@ VNAME_EXT=""
 SEG_SIZE=512
 SEG_START=4096
 BLOCK_SIZE=32
-BUDGETS=1024
+BUDGETS=2048
 VNAME=ssize${SEG_SIZE}_sstart${SEG_START}_bsize${BLOCK_SIZE}_budget${BUDGETS}_${VNAME_EXT}
 METHOD="-eattn"
 OUTPUT_DIR=lvpred/$MODEL_NAME"_${VNAME}"$METHOD
@@ -19,8 +19,8 @@ python prediction.py --model-path $MODEL --model-name $MODEL_NAME --model-max-le
   --block_size $BLOCK_SIZE \
   --budgets $BUDGETS \
 
-VNAME_EXT="v2_base"
-VNAME=base
+VNAME_EXT=""
+VNAME=base_${VNAME}
 METHOD=""
 OUTPUT_DIR=lvpred/$MODEL_NAME"_${VNAME}"$METHOD
 python prediction.py --model-path $MODEL --model-name $MODEL_NAME --model-max-len $MAX_LEN --output-dir $OUTPUT_DIR --single-process --data-path $DATASET $METHOD
