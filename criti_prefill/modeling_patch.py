@@ -25,3 +25,5 @@ def criti_config(model, segment_size=512, threshold_len=4096, block_size=32, bud
         layer.self_attn.layer_fusion = layer_fusion
         layer.self_attn.layer_skip = layer_skip
 
+    print(f"Criti config: segment_size={segment_size}, threshold_len={threshold_len}, block_size={block_size}, budgets={budgets}, prefill_only={prefill_only}, layer_fusion={layer_fusion}, layer_skip={layer_skip}", flush=True)
+

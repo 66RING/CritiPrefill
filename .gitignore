@@ -4,3 +4,4 @@ ignore/
 wandb
 *.pkl
 attn_viewer/
+criti_prefill.egg-info/

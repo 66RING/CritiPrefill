@@ -28,7 +28,6 @@ def main(args):
                  threshold_len=args.threshold_len,
                  block_size=args.block_size,
                  budgets=args.budgets,
-                 prefill_only=args.prefill_only,
                  layer_fusion=args.layer_fusion,
                  layer_skip=args.layer_skip)
 
@@ -57,8 +56,7 @@ if __name__ == "__main__":
     parser.add_argument("--block_size", type=int, default=32)
     parser.add_argument("--budgets", type=int, default=2048)
     parser.add_argument("--layer_skip", type=int, default=1)
-    parser.add_argument("--prefill_only", action='store_true', default=True)
-    parser.add_argument("--layer_fusion", action='store_true', default=True)
+    parser.add_argument("--layer_fusion", action='store_true')
     args = parser.parse_args()
     main(args)
 
