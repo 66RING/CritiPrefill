@@ -5,12 +5,11 @@ import time
 from transformers import AutoTokenizer, AutoModelForCausalLM
 # from modeling_llama import LlamaForCausalLM
 from transformers import LlamaForCausalLM
-from modeling_patch import replace_llama
-from quick_prefill import generate, quick_generate
-
-replace_llama()
+from criti_prefill.modeling_patch import replace_llama_eattention, criti_config
 
 def main(args):
+    if args.enable_eattention:
+        replace_llama_eattention()
     torch.manual_seed(0)
     device = "auto"
     dtype = torch.bfloat16
@@ -24,31 +23,43 @@ def main(args):
     prompt = "One day, Lily met a Shoggoth." * 1024 * 2
     # prompt = "Once upon a time. One day, Lily met a Shoggoth and a dragon."
 
+    criti_config(model,
+                 segment_size=args.segment_size,
+                 threshold_len=args.threshold_len,
+                 block_size=args.block_size,
+                 budgets=args.budgets,
+                 prefill_only=args.prefill_only,
+                 layer_fusion=args.layer_fusion,
+                 layer_skip=args.layer_skip)
+
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+    MAX_GEN_LENGTH = 50
 
     t = time.time()
     torch.cuda.synchronize()
-    generated_ids = generate(input_ids, model)
+    generated_ids = model.generate(
+        input_ids=input_ids,
+        max_new_tokens=MAX_GEN_LENGTH,
+        use_cache=True,
+        return_dict_in_generate=True).sequences
     torch.cuda.synchronize()
     t = time.time() - t
-    print("naive time:", t)
-
+    print("time:", t)
     generated_text = tokenizer.decode(generated_ids[0, input_ids.size(-1):], skip_special_tokens=True)
-    print("nai>", generated_text)
-
-
-    t = time.time()
-    torch.cuda.synchronize()
-    generated_ids = quick_generate(input_ids, model)
-    torch.cuda.synchronize()
-    t = time.time() - t
-    print("quick time:", t)
-
-    generated_text = tokenizer.decode(generated_ids[0, input_ids.size(-1):], skip_special_tokens=True)
-    print("seg>", generated_text)
+    print(">", generated_text)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--model_name_or_path", type=str, default="gpt2")
+    parser.add_argument("-e", "--enable_eattention", action='store_true')
+    parser.add_argument("--segment_size", type=int, default=512)
+    parser.add_argument("--threshold_len", type=int, default=1024)
+    parser.add_argument("--block_size", type=int, default=32)
+    parser.add_argument("--budgets", type=int, default=2048)
+    parser.add_argument("--layer_skip", type=int, default=1)
+    parser.add_argument("--prefill_only", action='store_true', default=True)
+    parser.add_argument("--layer_fusion", action='store_true', default=True)
     args = parser.parse_args()
     main(args)
+
+

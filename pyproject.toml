@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools", "wheel", "packaging"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "criti_prefill"
+version = "0.0.1"
+
+dependencies = [
+    "jieba==0.42.1",
+    "numpy==1.26.0",
+    "datasets==2.14.5",
+    "accelerate==0.23.0",
+    "tqdm==4.66.1",
+    "icetk==0.0.7"
+    "flash-attn==2.4.1"
+    "tokenizers==0.14.1"
+    "tiktoken==0.5.1"
+    "torch==2.1.1"
+    "transformers==4.39.2"
+    "sentencepiece==0.1.99",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
