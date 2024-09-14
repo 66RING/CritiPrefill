@@ -7,7 +7,6 @@
 
 ### Install
 
-
 ```
 pip install -e . && pip install flash_attn==2.5.8 --no-build-isolation
 ```
@@ -101,6 +100,21 @@ score = (1 - alpha) * score + alpha * prev_score
 ```
 
 ## Experiments
+
+Time to first token(TTFT) is one of the most intuitive metrics for user experience, yet it tends to be significantly slower compared to decoding time.
+
+![](./assets/time_ratio.png)
+
+CritiPrefill can significantly reduce the TTFT while maintaining generation quality.
+
+![](./assets/needle.png)
+
+![](./assets/speed_acc.png)
+
+
+
+
+
 
 
 
