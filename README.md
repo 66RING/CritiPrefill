@@ -81,7 +81,7 @@ To efficiently estimate the critical scores of the entire sequence, we track the
 S1 = qmax @ kmax
 S2 = qmax @ kmin
 S3 = qmin @ kmax
-S4 = qmax @ kmin
+S4 = qmin @ kmin
 
 S = max(mean(S1, S3), mean(S2, S4))
 ```
