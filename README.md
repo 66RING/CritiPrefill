@@ -35,7 +35,9 @@ criti_config(model,
 
 ### Segment-wise Sparsity
 
-This implementation is fully compatible with flash attention. After flash attention 2.1. the behavior of causal flag is changed: the causal mask is aligned to the bottom right corner of the attention matrix.
+We introduce a segment-wise structured sparsity mechanism. This implementation is compatible with flash attention.
+
+After flash attention 2.1. the behavior of causal flag is changed: the causal mask is aligned to the bottom right corner of the attention matrix.
 
 ```
 v2.0:
